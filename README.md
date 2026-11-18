@@ -125,3 +125,7 @@ docs/  integrations/  tests/
 Known limits: ACP support was tested against a scripted mock agent that follows the protocol, not against every real
 agent (they differ in login, modes, models and how much of the protocol they implement). The page is checked with
 headless-browser DOM tests and no console errors, not on every browser. Windows isn't supported.
+
+## Author
+
+Thiwat Chatkham, thiwat.cha.official@gmail.com
