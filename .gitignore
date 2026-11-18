@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.DS_Store
+# runtime data never belongs in the repo (the helper keeps it in its own data folder)
+config.json
+state.json
+stats.json
+.token
+*.log
+server.pid
+transcripts/
+attachments/
+probe/

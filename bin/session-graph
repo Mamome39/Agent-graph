@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""session-graph: start, stop and use the Session Graph board.
+
+  session-graph start | stop | restart | status | open | doctor | where
+  session-graph agents                        list the agents the board can start
+  session-graph agents add ID [--label L] [--model VALUE=LABEL ...] -- COMMAND [ARGS ...]
+                                              add an agent that speaks the Agent Client Protocol
+  session-graph spawn new --name NAME (--prompt TEXT | --prompt-file FILE) [--cwd DIR] [--agent ID] [--model M] [--effort E] [--mode ask|auto|edits|plan]
+  session-graph spawn status                  this session's sub-sessions: status, waiting permission prompts, last reply
+  session-graph spawn send ID TEXT            a follow-up message to one of them (ID can be the first 8 characters)
+
+`spawn` is for agents running on the board: it links the new session under the one that runs it, which is
+identified by $SESSION_GRAPH_SESSION_ID (set for every session the board starts; --parent overrides it).
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SERVER = os.path.join(os.path.dirname(HERE), "session_graph", "server.py")
+HOME = os.path.expanduser("~")
+DATA = os.path.abspath(os.path.expanduser(os.environ.get("SESSION_GRAPH_HOME") or os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"), "session-graph")))
+CONFIG = os.path.join(DATA, "config.json")
+
+
+def config():
+    try:
+        with open(CONFIG) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def port():
+    return int(os.environ.get("SESSION_GRAPH_PORT") or config().get("port") or 8767)
+
+
+def base():
+    return os.environ.get("SESSION_GRAPH_URL") or "http://127.0.0.1:%d" % port()
+
+
+def running():
+    try:
+        urllib.request.urlopen(base() + "/api/ping", timeout=1).read()
+        return True
+    except Exception:
+        return False
+
+
+def start(quiet=False):
+    if running():
+        if not quiet:
+            print("The board is already running at %s/" % base())
+        return True
+    os.makedirs(DATA, mode=0o700, exist_ok=True)
+    log = open(os.path.join(DATA, "server.log"), "ab")
+    p = subprocess.Popen([sys.executable, "-I", SERVER, "serve"], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         start_new_session=True, env=dict(os.environ, SESSION_GRAPH_PORT=str(port())))
+    with open(os.path.join(DATA, "server.pid"), "w") as f:
+        f.write(str(p.pid))
+    for _ in range(80):
+        if running():
+            if not quiet:
+                print("Started. The board is at %s/" % base())
+            return True
+        if p.poll() is not None:
+            break
+        time.sleep(0.25)
+    sys.exit("The board didn't start. The last lines of %s:\n%s" % (os.path.join(DATA, "server.log"), tail(os.path.join(DATA, "server.log"))))
+
+
+def tail(path, n=12):
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-n:])
+    except OSError:
+        return "(no log)"
+
+
+def stop():
+    pid_file = os.path.join(DATA, "server.pid")
+    try:
+        pid = int(open(pid_file).read().strip())
+    except Exception:
+        pid = 0
+    if not running():
+        print("The board isn't running.")
+        return
+    if not pid:
+        sys.exit("The board is running, but it wasn't started by this command (no pid file). Stop that process yourself.")
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(40):
+        if not running():
+            break
+        time.sleep(0.25)
+    print("Stopped. Sessions the board was running are paused; \u201cResume here\u201d on each one brings it back.")
+
+
+def token():
+    try:
+        with open(os.path.join(DATA, ".token")) as f:
+            return f.read().strip()
+    except OSError:
+        sys.exit("No access key found in %s. Start the board once first: session-graph start" % DATA)
+
+
+def call(action, body):
+    req = urllib.request.Request(base() + "/api/" + action, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "X-Graph-Token": token()})
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=120).read())
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.loads(e.read()).get("error")
+        except Exception:
+            msg = str(e)
+        sys.exit("session-graph: " + (msg or "the board refused that"))
+
+
+def detect_agents():
+    cfg = config()
+    agents = {"claude": {"type": "claude", "label": "Claude Code", "command": "claude"}}
+    agents.update(cfg.get("agents") or {})
+    rows = []
+    for aid, a in agents.items():
+        cmd = a.get("command") or ""
+        path = shutil.which(os.path.expanduser(cmd)) if cmd else None
+        rows.append((aid, a.get("label") or aid, a.get("type") or "acp", path, a))
+    return rows, cfg
+
+
+def cmd_agents(a):
+    if a.sub == "add":
+        if not re.match(r"^[A-Za-z0-9_-]{1,32}$", a.id):
+            sys.exit("The id can use letters, digits, dashes and underscores.")
+        argv = a.argv
+        if not argv:
+            sys.exit("Give the command after --, e.g.: session-graph agents add gemini --label \"Gemini CLI\" -- gemini --experimental-acp")
+        cfg = config()
+        entry = {"type": "acp", "label": a.label or a.id, "command": argv[0], "args": argv[1:]}
+        if a.model:
+            entry["models"] = [{"value": m.split("=", 1)[0], "label": m.split("=", 1)[-1]} for m in a.model]
+        cfg.setdefault("agents", {})[a.id] = entry
+        os.makedirs(DATA, mode=0o700, exist_ok=True)
+        with open(CONFIG, "w") as f:
+            json.dump(cfg, f, indent=2)
+        found = shutil.which(os.path.expanduser(argv[0]))
+        print("Added %s. %s" % (a.id, "Found %s." % found if found else "Warning: %r isn't on your PATH yet, so it won't be offered." % argv[0]))
+        print("Restart the board to pick it up: session-graph restart")
+        return
+    rows, _ = detect_agents()
+    for aid, label, typ, path, _a in rows:
+        print("%-12s %-18s %-7s %s" % (aid, label, typ, path or "not found on PATH"))
+
+
+def cmd_spawn(a):
+    parent = a.parent or os.environ.get("SESSION_GRAPH_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not parent:
+        sys.exit("spawn: no parent session (run it from a session the board started, or pass --parent)")
+    if not running():
+        start(quiet=True)
+    if a.spawn == "new":
+        prompt = a.prompt if a.prompt is not None else open(a.prompt_file).read()
+        name = " ".join(re.sub(r"[^\w .\-]", " ", a.name).split())[:60] or "Sub-session"
+        body = {"cwd": os.path.realpath(os.path.expanduser(a.cwd)), "prompt": prompt, "name": name, "parent": parent}
+        for k in ("agent", "model", "effort", "mode"):
+            if getattr(a, k):
+                body[k] = getattr(a, k)
+        r = call("new", body)
+        print("Started sub-session \"%s\" (%s) in %s." % (name, r["sid"], body["cwd"]))
+        print("It's on the Session Graph board under this session. Check on it with: session-graph spawn status")
+        return
+    kids = call("children", {"parent": parent})["children"]
+    if a.spawn == "status":
+        if not kids:
+            print("This session has no sub-sessions.")
+        for k in kids:
+            print("\u2014 %s [%s] %s  (%s)" % (k["name"], k["status"], k["sid"], k["cwd"]))
+            for p in k["pending"]:
+                print("    waiting for permission: " + p)
+            if k["last_reply"]:
+                print("    last reply:\n" + "\n".join("      " + line for line in k["last_reply"][-1500:].splitlines()))
+        return
+    match = [k for k in kids if k["sid"].startswith(a.id)]
+    if len(match) != 1:
+        sys.exit("spawn: no single sub-session of this session matches %r" % a.id)
+    call("send", {"sid": match[0]["sid"], "text": a.text})
+    print("Sent to %s." % match[0]["name"])
+
+
+def doctor():
+    ok = True
+
+    def line(good, text):
+        nonlocal ok
+        ok = ok and good
+        print(("ok    " if good else "FAIL  ") + text)
+
+    line(sys.version_info >= (3, 9), "Python %d.%d (3.9 or newer needed)" % sys.version_info[:2])
+    line(os.path.exists(SERVER), "server found")
+    rows, cfg = detect_agents()
+    usable = [r for r in rows if r[3]]
+    line(bool(usable), "agents found: %s" % (", ".join(r[0] for r in usable) or "none. Install Claude Code or add an ACP agent: session-graph agents add --help"))
+    for r in rows:
+        if not r[3]:
+            print("      %s: %r not on PATH (skipped)" % (r[0], r[4].get("command")))
+    print("      data folder: %s" % DATA)
+    print("      port: %d (%s)" % (port(), "board running" if running() else "board not running"))
+    sys.exit(0 if ok else 1)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="session-graph", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for n in ("start", "stop", "restart", "status", "open", "doctor", "where"):
+        sub.add_parser(n)
+    ag = sub.add_parser("agents")
+    ag.add_argument("sub", nargs="?", default="list", choices=["list", "add"])
+    ag.add_argument("id", nargs="?")
+    ag.add_argument("--label")
+    ag.add_argument("--model", action="append", help="VALUE=LABEL, repeatable")
+    sp = sub.add_parser("spawn")
+    sp.add_argument("--parent", default="")
+    ss = sp.add_subparsers(dest="spawn", required=True)
+    n = ss.add_parser("new")
+    n.add_argument("--name", required=True)
+    g = n.add_mutually_exclusive_group(required=True)
+    g.add_argument("--prompt")
+    g.add_argument("--prompt-file")
+    n.add_argument("--cwd", default=os.getcwd())
+    n.add_argument("--agent")
+    n.add_argument("--model")
+    n.add_argument("--effort")
+    n.add_argument("--mode", choices=["ask", "auto", "edits", "plan"])
+    ss.add_parser("status")
+    se = ss.add_parser("send")
+    se.add_argument("id")
+    se.add_argument("text")
+    argv = sys.argv[1:]
+    rest = []
+    if "--" in argv:  # everything after -- is the agent's own command line
+        i = argv.index("--")
+        argv, rest = argv[:i], argv[i + 1:]
+    a = ap.parse_args(argv)
+    a.argv = rest
+    if a.cmd == "start":
+        start()
+    elif a.cmd == "stop":
+        stop()
+    elif a.cmd == "restart":
+        stop()
+        start()
+    elif a.cmd == "status":
+        print("running at %s/" % base() if running() else "not running")
+        sys.exit(0 if running() else 1)
+    elif a.cmd == "open":
+        start(quiet=True)
+        webbrowser.open(base() + "/")
+        print("Opened %s/" % base())
+    elif a.cmd == "where":
+        print(DATA)
+    elif a.cmd == "doctor":
+        doctor()
+    elif a.cmd == "agents":
+        if a.sub == "add" and not a.id:
+            sys.exit("agents add needs an id")
+        cmd_agents(a)
+    elif a.cmd == "spawn":
+        cmd_spawn(a)
+
+
+if __name__ == "__main__":
+    main()
